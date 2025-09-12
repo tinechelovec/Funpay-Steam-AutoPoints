@@ -1,0 +1,1 @@
+# Funpay-Steam-AutoPoints
