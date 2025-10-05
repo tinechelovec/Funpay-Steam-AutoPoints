@@ -1,14 +1,15 @@
 import os
+import sys
 import logging
 import re
 import requests
+from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 
 from FunPayAPI import Account
 from FunPayAPI.updater.runner import Runner
 from FunPayAPI.updater.events import NewOrderEvent, NewMessageEvent
 
-# ---------- ENV ----------
 load_dotenv()
 FUNPAY_AUTH_TOKEN = os.getenv("FUNPAY_AUTH_TOKEN")
 BSP_API_KEY = os.getenv("BSP_API_KEY")
@@ -16,6 +17,8 @@ CATEGORY_ID = int(os.getenv("CATEGORY_ID", "714"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "300"))
 MIN_POINTS = int(os.getenv("MIN_POINTS", "100"))
 DEACTIVATE_CATEGORY_ID = int(os.getenv("DEACTIVATE_CATEGORY_ID", str(CATEGORY_ID)))
+LOG_FILE = os.getenv("LOG_FILE", "log.txt")
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "4"))
 
 def _env_bool_raw(name: str):
     return os.getenv(name)
@@ -38,7 +41,17 @@ try:
 except Exception:
     BSP_MIN_BALANCE = 5.0
 
-# ---------- LOGGING ----------
+
+CREATOR_NAME = os.getenv("CREATOR_NAME", "@tinechelovec").strip()
+CREATOR_URL = os.getenv("CREATOR_URL", "https://t.me/tinechelovec").strip()
+CHANNEL_URL = os.getenv("CHANNEL_URL", "https://t.me/by_thc").strip()
+GITHUB_URL = os.getenv("GITHUB_URL", "https://github.com/tinechelovec/Funpay-Steam-AutoPoints").strip()
+BANNER_NOTE = os.getenv(
+    "BANNER_NOTE",
+    "Бот бесплатный и с открытым исходным кодом. Автор НЕ продаёт бот; "
+    "любая платная продажа — инициатива третьих лиц."
+).strip()
+
 try:
     from colorama import init as colorama_init, Fore, Style
     colorama_init(autoreset=True)
@@ -67,25 +80,220 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s:%(lineno)d | %(message)s"
 )
+
+file_handler = logging.FileHandler(LOG_FILE, mode="a", encoding="utf-8", delay=False)
+file_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s:%(lineno)d | %(message)s")
+file_handler.setLevel(logging.INFO)
+file_handler.setFormatter(file_formatter)
+logging.getLogger().addHandler(file_handler)
+
 for h in logging.getLogger().handlers:
     try:
-        fmt = h.formatter._fmt if hasattr(h, "formatter") else "%(message)s"
-        h.setFormatter(ColorFormatter(fmt))
+        if isinstance(h, logging.FileHandler):
+            continue
+        fmt = h.formatter._fmt if hasattr(h, "formatter") and h.formatter else "%(message)s"
+        if isinstance(h, logging.StreamHandler) and getattr(h, "stream", None) in (sys.stdout, sys.stderr):
+            h.setFormatter(ColorFormatter(fmt))
     except Exception:
         pass
 
 logger = logging.getLogger("SteamPointsBot")
 
-# ---------- CONSTANTS ----------
+def _log_banner():
+    border = "═" * 78
+    logger.info(Style.BRIGHT + Fore.WHITE + border)
+    logger.info(Style.BRIGHT + Fore.CYAN  + "SteamPointsBot — информация о проекте")
+    logger.info(Style.BRIGHT + Fore.WHITE + border)
+
+    if CREATOR_NAME:
+        line = f"Создатель: {CREATOR_NAME}"
+        if CREATOR_URL:
+            line += f"  |  Контакт: {CREATOR_URL}"
+        logger.info(Fore.MAGENTA + line)
+    elif CREATOR_URL:
+        logger.info(Fore.MAGENTA + f"Контакт автора: {CREATOR_URL}")
+
+    if CHANNEL_URL:
+        logger.info(Fore.YELLOW + f"Канал с ботами/плагинами: {CHANNEL_URL}")
+    if GITHUB_URL:
+        logger.info(Fore.GREEN +  f"GitHub проекта: {GITHUB_URL}")
+
+    logger.info(Fore.RED + Style.BRIGHT + "Дисклеймер: " + Fore.RED + BANNER_NOTE)
+    logger.info(Style.BRIGHT + Fore.WHITE + border)
+
 BSP_BASE = "https://api.buysteampoints.com"
-USER_STATES = {}
+
+
+STATE_BY_CHAT: dict[int, dict] = {}
+USER_TO_CHATS: dict[int, set] = {}
 
 RE_STEAM_LINK = re.compile(
     r"^https?://(www\.)?steamcommunity\.com/(id|profiles)/[A-Za-z0-9_./-]+$",
     flags=re.IGNORECASE
 )
 
-# ==================== BSP (BuySteamPoints) API ====================
+EXECUTOR = ThreadPoolExecutor(max_workers=max(1, MAX_WORKERS))
+
+def _bind_state(state: dict):
+    chat_id = state["chat_id"]
+    buyer_id = state["buyer_id"]
+    STATE_BY_CHAT[chat_id] = state
+    USER_TO_CHATS.setdefault(buyer_id, set()).add(chat_id)
+    logger.debug(Fore.BLUE + f"[STATE] bind chat_id={chat_id}, buyer_id={buyer_id}. total_chats_for_user={len(USER_TO_CHATS[buyer_id])}")
+
+def _get_state(chat_id: int | None, user_id: int | None) -> dict | None:
+    if chat_id and chat_id in STATE_BY_CHAT:
+        return STATE_BY_CHAT[chat_id]
+
+    if user_id and user_id in USER_TO_CHATS and len(USER_TO_CHATS[user_id]) == 1:
+        only_chat_id = next(iter(USER_TO_CHATS[user_id]))
+        return STATE_BY_CHAT.get(only_chat_id)
+    return None
+
+def _pop_state_by_chat(chat_id: int):
+    st = STATE_BY_CHAT.pop(chat_id, None)
+    if st:
+        buyer_id = st.get("buyer_id")
+        if buyer_id in USER_TO_CHATS:
+            USER_TO_CHATS[buyer_id].discard(chat_id)
+            if not USER_TO_CHATS[buyer_id]:
+                USER_TO_CHATS.pop(buyer_id, None)
+        logger.debug(Fore.BLUE + f"[STATE] pop chat_id={chat_id}, buyer_id={buyer_id}")
+
+def _parse_fixed_lots_env(s: str) -> dict[str, int]:
+    mp = {}
+    if not s:
+        return mp
+    for chunk in s.split(","):
+        chunk = chunk.strip()
+        if not chunk or ":" not in chunk:
+            continue
+        k, v = chunk.split(":", 1)
+        try:
+            mp[str(k).strip()] = int(str(v).strip())
+        except Exception:
+            continue
+    return mp
+
+FIXED_LOT_BY_ID = _parse_fixed_lots_env(os.getenv("FIXED_LOT_BY_ID", ""))
+ALLOW_TITLE_DETECTION = _env_bool("ALLOW_TITLE_DETECTION", True)
+
+RE_PTS_IN_TITLE = re.compile(r"(?<!\d)(\d{3,7})\s*(?:очк|очков|points)\b", re.IGNORECASE)
+RE_FROM_IN_TITLE = re.compile(r"\bот\s*\d+", re.IGNORECASE)
+RE_ANY_NUMBER = re.compile(r"(?<!\d)(\d{3,7})(?!\d)")
+
+def _get_lot_id(order) -> str | None:
+    candidates = [
+        getattr(order, "lot_id", None),
+        getattr(order, "lotId", None),
+        getattr(getattr(order, "lot", None), "id", None),
+        getattr(getattr(order, "good", None), "id", None),
+        getattr(getattr(order, "item", None), "id", None),
+    ]
+    for c in candidates:
+        if c is None:
+            continue
+        try:
+            return str(c)
+        except Exception:
+            return None
+    return None
+
+def _detect_fixed_unit_points(order) -> tuple[int | None, str]:
+    lot_id = _get_lot_id(order)
+    title = (getattr(order, "title", "") or "").strip()
+
+    if lot_id and lot_id in FIXED_LOT_BY_ID:
+        try:
+            val = int(FIXED_LOT_BY_ID[lot_id])
+            logger.info(Fore.MAGENTA + f"✅ Фикс-лот определён по ID: 1 шт. = {val} очков (lot_id={lot_id}).")
+            return val, f"lot_id:{lot_id}"
+        except Exception:
+            pass
+
+    if not ALLOW_TITLE_DETECTION:
+        return None, "not_fixed"
+
+    if RE_FROM_IN_TITLE.search(title):
+        logger.info(Fore.BLUE + f"ℹ️ Режим «от N»: заголовок содержит 'от ...'. Покупатель сам задаёт количество. Заголовок: '{title}'")
+        return None, "title_has_ot"
+
+    m = RE_PTS_IN_TITLE.search(title)
+    if m:
+        try:
+            val = int(m.group(1))
+            if val >= MIN_POINTS and val % 100 == 0:
+                logger.info(Fore.MAGENTA + f"✅ Фикс-лот по заголовку: 1 шт. = {val} очков. Заголовок: '{title}'")
+                return val, "title_regex"
+        except Exception:
+            pass
+
+    numbers = []
+    try:
+        numbers = [int(x) for x in RE_ANY_NUMBER.findall(title)]
+    except Exception:
+        numbers = []
+
+    if numbers:
+        candidates = [n for n in numbers if n >= MIN_POINTS and n % 100 == 0]
+        if candidates:
+            val = max(candidates)
+            logger.info(
+                Fore.MAGENTA
+                + f"✅ Фикс-лот по числу в названии: 1 шт. = {val} очков | найденные: {numbers} | подходящие: {candidates} | заголовок: '{title}'"
+            )
+            return val, "title_digits"
+        else:
+            logger.info(
+                Fore.BLUE
+                + f"ℹ️ В заголовке найдены числа, но они не подходят (минимум {MIN_POINTS}, кратно 100). "
+                  f"Найденные: {numbers} | заголовок: '{title}'"
+            )
+
+    return None, "not_fixed"
+
+def get_points_strict(order) -> tuple[int | None, str]:
+    buyer_params = getattr(order, "buyer_params", {}) or {}
+    for k, v in buyer_params.items():
+        try:
+            n = int(str(v).strip().replace(" ", ""))
+            if n > 0:
+                logger.info(Fore.CYAN + f"ℹ️ Количество взято из параметров покупателя: {n} (buyer_params:{k})")
+                return n, f"buyer_params:{k}"
+        except Exception:
+            continue
+
+    amt = getattr(order, "amount", None)
+    try:
+        amt = int(amt) if amt is not None else None
+    except Exception:
+        amt = None
+    if amt and amt >= 1:
+        logger.info(Fore.CYAN + f"ℹ️ Количество определено по числу штук: {amt} (amount)")
+        return amt, "amount"
+
+    return None, "not_found"
+
+def get_points(order) -> tuple[int | None, str]:
+
+    unit_points, src = _detect_fixed_unit_points(order)
+    if unit_points:
+        units = getattr(order, "amount", None)
+        try:
+            units = int(units) if units is not None else 1
+        except Exception:
+            units = 1
+        if units < 1:
+            units = 1
+        total = unit_points * units
+        logger.info(
+            Fore.MAGENTA
+            + f"🧮 Расчёт фикс-лота: {unit_points} очков × {units} шт. = {total} очков (источник: {src})"
+        )
+        return total, f"fixed:{src}:{unit_points}x{units}"
+
+    return get_points_strict(order)
+
 def bsp_create_order(points: int, steam_link: str):
     payload = {
         "api_key": BSP_API_KEY,
@@ -147,7 +355,6 @@ def bsp_check_balance() -> float | None:
     logger.warning(Fore.YELLOW + "[BSP] Не удалось получить баланс BSP (эндпоинт не распознан).")
     return None
 
-# ==================== HELPERS ====================
 def _points_to_human(points: int) -> str:
     return f"{points:,}".replace(",", " ")
 
@@ -242,81 +449,6 @@ def deactivate_category(account: Account, category_id: int) -> int:
     logger.warning(Fore.YELLOW + f"[LOTS] Всего деактивировано: {deactivated}")
     return deactivated
 
-def get_points_strict(order) -> tuple[int | None, str]:
-    buyer_params = getattr(order, "buyer_params", {}) or {}
-    for k, v in buyer_params.items():
-        try:
-            n = int(str(v).strip().replace(" ", ""))
-            if n > 0:
-                return n, f"buyer_params:{k}"
-        except Exception:
-            continue
-
-    amt = getattr(order, "amount", None)
-    try:
-        amt = int(amt) if amt is not None else None
-    except Exception:
-        amt = None
-    if amt and amt >= 1:
-        return amt, "amount"
-
-    return None, "not_found"
-
-# ==================== HANDLERS ====================
-def handle_new_order(account: Account, order):
-    subcat = getattr(order, "subcategory", None) or getattr(order, "sub_category", None)
-    subcat_id = getattr(subcat, "id", None)
-    if subcat_id != CATEGORY_ID:
-        logger.info(Fore.BLUE + f"[ORDER] Пропуск заказа {order.id} (subcategory {subcat_id} != {CATEGORY_ID})")
-        return
-
-    chat_id = getattr(order, "chat_id", None)
-    buyer_id = getattr(order, "buyer_id", None)
-
-    logger.info(Style.BRIGHT + Fore.WHITE + "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    logger.info(Style.BRIGHT + Fore.CYAN + f"🆕 Новый заказ #{getattr(order, 'id', 'unknown')} | Покупатель: {buyer_id}")
-    title = getattr(order, "title", None)
-    if title:
-        logger.info(Fore.CYAN + f"📦 Товар: {title}")
-    logger.info(Style.BRIGHT + Fore.WHITE + "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-
-    points_raw, src = get_points_strict(order)
-    if points_raw is None:
-        msg = ("⚠️ Не указано количество очков.\n"
-               "Пожалуйста, оформите заказ с выбором количества очков (в поле или количеством штук).")
-        if AUTO_REFUND:
-            _nice_refund(account, chat_id, getattr(order, "id", None), msg)
-        else:
-            account.send_message(chat_id, msg + "\n\nАвто-возврат отключён, напишите в чат для возврата.")
-        return
-
-    points = int(points_raw)
-    if points < MIN_POINTS or (points % 100 != 0):
-        msg = (f"⚠️ Некорректное количество очков: {points}.\n"
-               f"Минимум — {MIN_POINTS} и кратно 100 (например: 100, 500, 1000).\n"
-               f"Оформите, пожалуйста, заказ заново.")
-        if AUTO_REFUND:
-            _nice_refund(account, chat_id, getattr(order, "id", None), msg)
-        else:
-            account.send_message(chat_id, msg + "\n\nАвто-возврат отключён, напишите в чат для возврата.")
-        return
-
-    USER_STATES[buyer_id] = {
-        "step": "waiting_link",
-        "order_id": getattr(order, "id", None),
-        "chat_id": chat_id,
-        "points": points
-    }
-
-    msg = (
-        "👋 Спасибо за заказ очков Steam!\n\n"
-        f"Количество: *{_points_to_human(points)}*\n"
-        "\nПожалуйста, отправьте ссылку на ваш профиль Steam:\n"
-        "`https://steamcommunity.com/id/ваш_id` или `https://steamcommunity.com/profiles/7656119...`"
-    )
-    account.send_message(chat_id, msg)
-    logger.info(Fore.BLUE + f"⏳ Ожидаем ссылку Steam от покупателя {buyer_id}... (src={src}, points={points})")
-
 def _after_bsp_failure(account: Account, state: dict, err_text: str):
     chat_id = state.get("chat_id")
     order_id = state.get("order_id")
@@ -347,15 +479,103 @@ def _after_bsp_failure(account: Account, state: dict, err_text: str):
         else:
             logger.warning(Fore.MAGENTA + "[LOTS] AUTO_DEACTIVATE выключен — деактивацию лотов нужно сделать вручную.")
 
+def _process_bsp_order(account: Account, state: dict):
+    chat_id = state["chat_id"]
+    points = state["points"]
+    steam_link = state["steam_link"]
+    order_id = state["order_id"]
+    try:
+        logger.info(Fore.BLUE + f"🧾 [WORKER] Создание BSP: {points} очков -> {steam_link} (order #{order_id})")
+        ok, data, r = bsp_create_order(points, steam_link)
+        if not ok:
+            err = (data.get("error") or (r.text[:200] if r is not None else "Unknown error"))
+            logger.error(Fore.RED + f"[BSP] Ошибка оформления: {err} (order #{order_id})")
+            _after_bsp_failure(account, state, f"Причина: {err}")
+            return
+
+        account.send_message(
+            chat_id,
+            "🎉 Готово! Пополнение отправлено.\n\n"
+            f"Профиль: *{steam_link}*\n"
+            f"Очки: *{_points_to_human(points)}*\n\n"
+            "Проверьте, пожалуйста, зачисление очков в Steam.\n"
+            "Чтобы завершить заказ — **подтвердите его у себя на FunPay** на странице заказа (кнопка «Подтвердить выполнение»).\n"
+            "Если есть проблема — опишите ситуацию здесь в чате, администратор ответит как можно быстрее."
+        )
+        logger.info(Fore.GREEN + f"✅ BSP заказ создан (order #{order_id}). Ждём подтверждение покупателя.")
+    except Exception as e:
+        logger.exception(Fore.RED + f"[WORKER] Исключение при оформлении BSP (order #{order_id}): {e}")
+        try:
+            account.send_message(chat_id, "❌ Внутренняя ошибка при оформлении. Свяжитесь с админом.")
+        except Exception:
+            pass
+    finally:
+        _pop_state_by_chat(chat_id)
+
+def handle_new_order(account: Account, order):
+    subcat = getattr(order, "subcategory", None) or getattr(order, "sub_category", None)
+    subcat_id = getattr(subcat, "id", None)
+    if subcat_id != CATEGORY_ID:
+        logger.info(Fore.BLUE + f"[ORDER] Пропуск заказа {order.id} (subcategory {subcat_id} != {CATEGORY_ID})")
+        return
+
+    chat_id = getattr(order, "chat_id", None)
+    buyer_id = getattr(order, "buyer_id", None)
+
+    logger.info(Style.BRIGHT + Fore.WHITE + "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    logger.info(Style.BRIGHT + Fore.CYAN + f"🆕 Новый заказ #{getattr(order, 'id', 'unknown')} | Покупатель: {buyer_id}")
+    title = getattr(order, "title", None)
+    if title:
+        logger.info(Fore.CYAN + f"📦 Товар: {title}")
+    logger.info(Style.BRIGHT + Fore.WHITE + "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+    points_raw, src = get_points(order)
+    if points_raw is None:
+        msg = ("⚠️ Не указано количество очков.\n"
+               "Пожалуйста, оформите заказ с выбором количества очков (в поле или количеством штук).")
+        if AUTO_REFUND:
+            _nice_refund(account, chat_id, getattr(order, "id", None), msg)
+        else:
+            account.send_message(chat_id, msg + "\n\nАвто-возврат отключён, напишите в чат для возврата.")
+        return
+
+    points = int(points_raw)
+    if points < MIN_POINTS or (points % 100 != 0):
+        msg = (f"⚠️ Некорректное количество очков: {points}.\n"
+               f"Минимум — {MIN_POINTS} и кратно 100 (например: 100, 500, 1000).\n"
+               f"Оформите, пожалуйста, заказ заново.")
+        if AUTO_REFUND:
+            _nice_refund(account, chat_id, getattr(order, "id", None), msg)
+        else:
+            account.send_message(chat_id, msg + "\n\nАвто-возврат отключён, напишите в чат для возврата.")
+        return
+
+    state = {
+        "step": "waiting_link",
+        "order_id": getattr(order, "id", None),
+        "chat_id": chat_id,
+        "buyer_id": buyer_id,
+        "points": points
+    }
+    _bind_state(state)
+
+    msg = (
+        "👋 Спасибо за заказ очков Steam!\n\n"
+        f"Количество: *{_points_to_human(points)}*\n"
+        "\nПожалуйста, отправьте ссылку на ваш профиль Steam:\n"
+        "`https://steamcommunity.com/id/ваш_id` или `https://steamcommunity.com/profiles/7656119...`"
+    )
+    account.send_message(chat_id, msg)
+    logger.info(Fore.BLUE + f"⏳ Ожидаем ссылку Steam от покупателя {buyer_id}… Источник: {src}, очков к зачислению: {points}")
+
 def handle_new_message(account: Account, message):
     user_id = getattr(message, "author_id", None)
     chat_id = getattr(message, "chat_id", None)
     text = (getattr(message, "text", "") or "").strip()
 
-    if not user_id or user_id not in USER_STATES:
+    state = _get_state(chat_id, user_id)
+    if not state:
         return
-
-    state = USER_STATES[user_id]
 
     if state["step"] == "waiting_link":
         link = text
@@ -382,33 +602,12 @@ def handle_new_message(account: Account, message):
             "Изменить количество очков можно только при оформлении нового заказа."
         )
         account.send_message(chat_id, msg)
-        logger.info(Fore.GREEN + f"✅ Ссылка подтверждена: {link}")
+        logger.info(Fore.GREEN + f"✅ Ссылка подтверждена (chat {chat_id}): {link}")
         return
 
     if state["step"] == "confirm_order":
         if text == "+":
-            points = state["points"]
-            steam_link = state["steam_link"]
-            logger.info(Fore.BLUE + f"🧾 Создание заказа BSP: {points} -> {steam_link}")
-            ok, data, r = bsp_create_order(points, steam_link)
-            if not ok:
-                err = (data.get("error") or (r.text[:200] if r is not None else "Unknown error"))
-                logger.error(Fore.RED + f"[BSP] Ошибка оформления: {err}")
-                _after_bsp_failure(account, state, f"Причина: {err}")
-                USER_STATES.pop(user_id, None)
-                return
-
-            account.send_message(
-                chat_id,
-                "🎉 Готово! Пополнение отправлено.\n\n"
-                f"Профиль: *{steam_link}*\n"
-                f"Очки: *{_points_to_human(points)}*\n\n"
-                "Проверьте, пожалуйста, зачисление очков в Steam.\n"
-                "Чтобы завершить заказ — **подтвердите его у себя на FunPay** на странице заказа (кнопка «Подтвердить выполнение»).\n"
-                "Если есть проблема — опишите ситуацию здесь в чате, администратор ответит как можно быстрее."
-            )
-            logger.info(Fore.GREEN + "✅ BSP заказ создан. Дальше подтверждение со стороны покупателя на FunPay.")
-            USER_STATES.pop(user_id, None)
+            EXECUTOR.submit(_process_bsp_order, account, state.copy())
         else:
             link = text
             if not _steam_link_valid(link):
@@ -427,16 +626,15 @@ def handle_new_message(account: Account, message):
                 f"Очки: *{_points_to_human(state['points'])}*\n"
                 "Если всё верно — напишите `+` для оформления пополнения."
             )
-            logger.info(Fore.GREEN + f"♻️ Ссылка обновлена: {link}")
+            logger.info(Fore.GREEN + f"♻️ Ссылка обновлена (chat {chat_id}): {link}")
         return
-    
+
     account.send_message(
         chat_id,
         "ℹ️ Если пополнение уже отправлено — подтвердите заказ у себя на FunPay на странице заказа.\n"
         "По вопросам — напишите здесь, поможем."
     )
 
-# ==================== RUNNER LOOP ====================
 def main():
     if not FUNPAY_AUTH_TOKEN:
         raise RuntimeError("FUNPAY_AUTH_TOKEN не найден в .env")
@@ -454,6 +652,10 @@ def main():
     account.get()
     logger.info(Fore.GREEN + f"🔐 Авторизован как {getattr(account, 'username', '(unknown)')}")
     logger.info(Fore.CYAN + f"Настройки: AUTO_REFUND={AUTO_REFUND}, AUTO_DEACTIVATE={AUTO_DEACTIVATE}, BSP_MIN_BALANCE={BSP_MIN_BALANCE}, DEACTIVATE_CATEGORY_ID={DEACTIVATE_CATEGORY_ID}")
+    logger.info(Fore.CYAN + f"FIXED_LOT_BY_ID={FIXED_LOT_BY_ID}, ALLOW_TITLE_DETECTION={ALLOW_TITLE_DETECTION}")
+    logger.info(Fore.CYAN + f"MAX_WORKERS={MAX_WORKERS} (параллельные оформления BSP)")
+
+    _log_banner()
 
     runner = Runner(account)
     logger.info(Style.BRIGHT + Fore.WHITE + "🚀 SteamPointsBot запущен. Ожидаю события...")
@@ -469,4 +671,4 @@ def main():
             logger.exception(Fore.RED + "Ошибка в основном цикле")
 
 if __name__ == "__main__":
-    main()
+     main()
