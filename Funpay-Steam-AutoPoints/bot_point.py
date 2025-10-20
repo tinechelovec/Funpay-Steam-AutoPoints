@@ -177,6 +177,7 @@ def _parse_fixed_lots_env(s: str) -> dict[str, int]:
 
 FIXED_LOT_BY_ID = _parse_fixed_lots_env(os.getenv("FIXED_LOT_BY_ID", ""))
 ALLOW_TITLE_DETECTION = _env_bool("ALLOW_TITLE_DETECTION", True)
+NON_MULTIPLE_POINTS_POLICY = os.getenv("NON_MULTIPLE_POINTS_POLICY", "refund").strip().lower()
 
 RE_PTS_IN_TITLE = re.compile(r"(?<!\d)(\d{3,7})\s*(?:очк|очков|points)\b", re.IGNORECASE)
 RE_FROM_IN_TITLE = re.compile(r"\bот\s*\d+", re.IGNORECASE)
@@ -540,7 +541,33 @@ def handle_new_order(account: Account, order):
         return
 
     points = int(points_raw)
-    if points < MIN_POINTS or (points % 100 != 0):
+    corrected_note = ""
+
+    if points % 100 != 0:
+        policy = NON_MULTIPLE_POINTS_POLICY if NON_MULTIPLE_POINTS_POLICY in ("refund", "floor") else "refund"
+        if policy == "floor":
+            new_points = (points // 100) * 100
+            if new_points < MIN_POINTS:
+                msg = (f"⚠️ Количество очков: {points} (после уменьшения {new_points}) ниже минимума {MIN_POINTS}.\n"
+                       f"Оформите, пожалуйста, заказ заново.")
+                if AUTO_REFUND:
+                    _nice_refund(account, chat_id, getattr(order, "id", None), msg)
+                else:
+                    account.send_message(chat_id, msg + "\n\nАвто-возврат отключён, напишите в чат для возврата.")
+                return
+            logger.info(Fore.CYAN + f"🔧 Количество скорректировано: {points} → {new_points} по политике 'floor'.")
+            points = new_points
+            corrected_note = "\nℹ️ Некратное 100 значение было уменьшено до *" + _points_to_human(points) + "* согласно настройке продавца."
+        else:
+            msg = (f"⚠️ Количество очков: {points} не кратно 100.\n"
+                   f"По настройке продавца выполняется полный возврат. Оформите заказ заново с количеством, кратным 100.")
+            if AUTO_REFUND:
+                _nice_refund(account, chat_id, getattr(order, "id", None), msg)
+            else:
+                account.send_message(chat_id, msg + "\n\nАвто-возврат отключён, напишите в чат для возврата.")
+            return
+
+    if points < MIN_POINTS:
         msg = (f"⚠️ Некорректное количество очков: {points}.\n"
                f"Минимум — {MIN_POINTS} и кратно 100 (например: 100, 500, 1000).\n"
                f"Оформите, пожалуйста, заказ заново.")
@@ -562,6 +589,7 @@ def handle_new_order(account: Account, order):
     msg = (
         "👋 Спасибо за заказ очков Steam!\n\n"
         f"Количество: *{_points_to_human(points)}*\n"
+        f"{corrected_note}"
         "\nПожалуйста, отправьте ссылку на ваш профиль Steam:\n"
         "`https://steamcommunity.com/id/ваш_id` или `https://steamcommunity.com/profiles/7656119...`"
     )
@@ -653,6 +681,7 @@ def main():
     logger.info(Fore.GREEN + f"🔐 Авторизован как {getattr(account, 'username', '(unknown)')}")
     logger.info(Fore.CYAN + f"Настройки: AUTO_REFUND={AUTO_REFUND}, AUTO_DEACTIVATE={AUTO_DEACTIVATE}, BSP_MIN_BALANCE={BSP_MIN_BALANCE}, DEACTIVATE_CATEGORY_ID={DEACTIVATE_CATEGORY_ID}")
     logger.info(Fore.CYAN + f"FIXED_LOT_BY_ID={FIXED_LOT_BY_ID}, ALLOW_TITLE_DETECTION={ALLOW_TITLE_DETECTION}")
+    logger.info(Fore.CYAN + f"NON_MULTIPLE_POINTS_POLICY={NON_MULTIPLE_POINTS_POLICY}")
     logger.info(Fore.CYAN + f"MAX_WORKERS={MAX_WORKERS} (параллельные оформления BSP)")
 
     _log_banner()
